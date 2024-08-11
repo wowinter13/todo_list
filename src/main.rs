@@ -1,5 +1,6 @@
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use clap::{Parser, Subcommand};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -26,8 +27,8 @@ impl FromStr for TaskStatus {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "on" => Ok(TaskStatus::Active),
-            "done" => Ok(TaskStatus::Done),
+            "on" | "active" | "a" => Ok(TaskStatus::Active),
+            "done" | "d" => Ok(TaskStatus::Done),
             _ => Err(format!("Invalid status: {}", s)),
         }
     }
@@ -131,17 +132,13 @@ impl TodoList {
         self.tasks.values().collect()
     }
 
-    pub fn filter_tasks(&self, predicate: &str) -> Vec<&Task> {
-        let predicates: Vec<Predicate> = predicate
-            .split("and")
-            .map(str::trim)
-            .filter_map(|p| Predicate::from_str(p).ok())
-            .collect();
-
-        self.tasks
+    pub fn filter_tasks(&self, predicate: &str) -> Result<Vec<&Task>, String> {
+        let predicates = parse_predicates(predicate)?;
+        Ok(self
+            .tasks
             .values()
             .filter(|task| predicates.iter().all(|p| p.matches(task)))
-            .collect()
+            .collect())
     }
 
     fn save(&self) {
@@ -238,9 +235,42 @@ enum Commands {
     List,
 }
 
-fn parse_date(arg: &str) -> Result<DateTime<Local>, chrono::ParseError> {
-    let naive = NaiveDateTime::parse_from_str(arg, "%Y-%m-%d %H:%M")?;
+fn parse_date(date_str: &str) -> Result<DateTime<Local>, chrono::ParseError> {
+    let naive = NaiveDateTime::parse_from_str(date_str, "%Y-%m-%d %H:%M")?;
     Ok(Local.from_local_datetime(&naive).unwrap())
+}
+
+fn parse_predicates(predicate: &str) -> Result<Vec<Predicate>, String> {
+    let re = Regex::new(r#"(\w+)\s*(=|<|>|like)\s*"([^"]*)""#).unwrap();
+    let captures: Vec<_> = re.captures_iter(predicate).collect();
+
+    if captures.is_empty() {
+        return Err("Invalid predicate format".to_string());
+    }
+
+    captures
+        .into_iter()
+        .map(|cap| {
+            let field = cap[1].to_lowercase();
+            let operator = &cap[2];
+            let value = cap[3].to_string();
+
+            match (field.as_str(), operator) {
+                ("category", "=") => Ok(Predicate::Category(value)),
+                ("status", "=") => TaskStatus::from_str(&value)
+                    .map(Predicate::Status)
+                    .map_err(|e| e.to_string()),
+                ("date", "<") => parse_date(&value)
+                    .map(Predicate::DateBefore)
+                    .map_err(|e| e.to_string()),
+                ("date", ">") => parse_date(&value)
+                    .map(Predicate::DateAfter)
+                    .map_err(|e| e.to_string()),
+                ("description", "like") => Ok(Predicate::DescriptionContains(value)),
+                _ => Err(format!("Unknown predicate: {}", field)),
+            }
+        })
+        .collect()
 }
 
 fn main() {
@@ -334,23 +364,25 @@ fn main() {
             Ok(_) => println!("Task '{}' deleted successfully", title),
             Err(e) => eprintln!("Error: {}", e),
         },
-        Commands::Select { predicate } => {
-            let filtered_tasks = todo_list.filter_tasks(&predicate);
-            if filtered_tasks.is_empty() {
-                println!("No tasks match the given predicate.");
-            } else {
-                for task in filtered_tasks {
-                    println!(
-                        "{}: {} ({}) - {} - {}",
-                        task.title,
-                        task.description,
-                        task.status,
-                        task.category,
-                        task.creation_date
-                    );
+        Commands::Select { predicate } => match todo_list.filter_tasks(&predicate) {
+            Ok(filtered_tasks) => {
+                if filtered_tasks.is_empty() {
+                    println!("No tasks match the given predicate.");
+                } else {
+                    for task in filtered_tasks {
+                        println!(
+                            "{}: {} ({}) - {} - {}",
+                            task.title,
+                            task.description,
+                            task.status,
+                            task.category,
+                            task.creation_date
+                        );
+                    }
                 }
             }
-        }
+            Err(e) => eprintln!("Error filtering tasks: {}", e),
+        },
         Commands::List => {
             let all_tasks = todo_list.get_all_tasks();
             if all_tasks.is_empty() {
@@ -456,12 +488,17 @@ mod tests {
         todo_list.add_task(task1).unwrap();
         todo_list.add_task(task2).unwrap();
 
-        let filtered = todo_list.filter_tasks("category = Category1");
+        let filtered = todo_list.filter_tasks(r#"category = "Category1""#).unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].title, "Task 1");
 
-        let filtered = todo_list.filter_tasks("description like \"Description\"");
+        let filtered = todo_list
+            .filter_tasks(r#"description like "Description""#)
+            .unwrap();
         assert_eq!(filtered.len(), 2);
+
+        assert!(todo_list.filter_tasks("invalid predicate").is_err());
+
         cleanup_file(&file_path);
     }
 
